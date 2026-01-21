@@ -1,615 +1,319 @@
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-  Tool,
-} from "@modelcontextprotocol/sdk/types.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
 import http from "http";
-import { URL } from "url";
 
-// =============================================================================
-// SUMBLE API CLIENT
-// =============================================================================
-
-const SUMBLE_API_BASE = "https://api.sumble.com";
-
-interface SumbleClientConfig {
-  apiKey: string;
+const SUMBLE_API_KEY = process.env.SUMBLE_API_KEY;
+if (!SUMBLE_API_KEY) {
+  console.error("Error: SUMBLE_API_KEY environment variable is required");
+  process.exit(1);
 }
 
-class SumbleClient {
-  private apiKey: string;
+const BASE_URL = "https://api.sumble.com";
 
-  constructor(config: SumbleClientConfig) {
-    this.apiKey = config.apiKey;
+async function sumbleRequest(endpoint: string, method: string = "GET", body?: any) {
+  const url = `${BASE_URL}${endpoint}`;
+  const options: RequestInit = {
+    method,
+    headers: {
+      "Authorization": `Bearer ${SUMBLE_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+  };
+  if (body) {
+    options.body = JSON.stringify(body);
+  }
+  const response = await fetch(url, options);
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Sumble API error: ${response.status} ${errorText}`);
+  }
+  return response.json();
+}
+
+// Create MCP server
+const server = new McpServer({
+  name: "sumble-mcp-server",
+  version: "1.0.0",
+});
+
+// Register tools
+server.tool(
+  "find_organizations",
+  "Search for organizations by technology stack, industry, location, and other criteria. Costs 5 credits per filter per organization returned.",
+  {
+    technologies: z.array(z.string()).optional().describe("Filter by technologies used"),
+    industries: z.array(z.string()).optional().describe("Filter by industries"),
+    countries: z.array(z.string()).optional().describe("Filter by countries"),
+    employee_range: z.string().optional().describe("Employee range like '1-10', '11-50', '51-200'"),
+    limit: z.number().optional().default(10).describe("Maximum results to return"),
+    offset: z.number().optional().default(0).describe("Offset for pagination"),
+  },
+  async (params) => {
+    const result = await sumbleRequest("/v1/organizations/search", "POST", params);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "enrich_organization",
+  "Get detailed technology stack and company information for a specific organization. Costs 5 credits per technology returned.",
+  {
+    domain: z.string().describe("Company domain to enrich (e.g., 'example.com')"),
+  },
+  async (params) => {
+    const result = await sumbleRequest(`/v1/organizations/enrich?domain=${encodeURIComponent(params.domain)}`);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "find_jobs",
+  "Search for job listings. Costs 3 credits per job returned.",
+  {
+    keywords: z.string().optional().describe("Keywords to search for"),
+    technologies: z.array(z.string()).optional().describe("Filter by technologies"),
+    countries: z.array(z.string()).optional().describe("Filter by countries"),
+    remote: z.boolean().optional().describe("Filter for remote jobs"),
+    limit: z.number().optional().default(10).describe("Maximum results"),
+    offset: z.number().optional().default(0).describe("Offset for pagination"),
+  },
+  async (params) => {
+    const result = await sumbleRequest("/v1/jobs/search", "POST", params);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+server.tool(
+  "find_people",
+  "Search for people/contacts at companies. Costs 1 credit per person returned.",
+  {
+    organization_domain: z.string().optional().describe("Filter by company domain"),
+    job_titles: z.array(z.string()).optional().describe("Filter by job titles"),
+    countries: z.array(z.string()).optional().describe("Filter by countries"),
+    limit: z.number().optional().default(10).describe("Maximum results"),
+    offset: z.number().optional().default(0).describe("Offset for pagination"),
+  },
+  async (params) => {
+    const result = await sumbleRequest("/v1/people/search", "POST", params);
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  }
+);
+
+// Simple HTTP server with SSE support
+const PORT = parseInt(process.env.PORT || "3000");
+
+interface SSEClient {
+  id: string;
+  res: http.ServerResponse;
+}
+
+const clients = new Map<string, SSEClient>();
+
+const httpServer = http.createServer(async (req, res) => {
+  // CORS headers
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
   }
 
-  private async request<T>(endpoint: string, body: object): Promise<T> {
-    const response = await fetch(`${SUMBLE_API_BASE}${endpoint}`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${this.apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
+  const url = new URL(req.url || "/", `http://localhost:${PORT}`);
+
+  // Health check
+  if (url.pathname === "/" || url.pathname === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ status: "ok", server: "sumble-mcp-server" }));
+    return;
+  }
+
+  // SSE endpoint
+  if (url.pathname === "/sse" && req.method === "GET") {
+    const clientId = Math.random().toString(36).substring(7);
+    
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
     });
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`Sumble API error (${response.status}): ${errorText}`);
-    }
+    // Send endpoint info
+    const endpoint = `${url.protocol}//${req.headers.host}/message?sessionId=${clientId}`;
+    res.write(`event: endpoint\ndata: ${endpoint}\n\n`);
 
-    return response.json() as Promise<T>;
+    clients.set(clientId, { id: clientId, res });
+    console.log(`New SSE connection: ${clientId}`);
+
+    req.on("close", () => {
+      clients.delete(clientId);
+      console.log(`SSE connection closed: ${clientId}`);
+    });
+
+    // Keep alive
+    const keepAlive = setInterval(() => {
+      if (clients.has(clientId)) {
+        res.write(": keepalive\n\n");
+      } else {
+        clearInterval(keepAlive);
+      }
+    }, 30000);
+
+    return;
   }
 
-  async findOrganizations(params: {
-    filters: {
-      technologies?: string[];
-      technology_categories?: string[];
-      since?: string;
-      query?: string;
-    };
-    order_by_column?: string;
-    order_by_direction?: "ASC" | "DESC";
-    limit?: number;
-    offset?: number;
-  }) {
-    return this.request("/v3/organizations/find", params);
-  }
-
-  async enrichOrganization(params: {
-    organization: { domain?: string; id?: number; slug?: string };
-    filters: {
-      technologies?: string[];
-      technology_categories?: string[];
-      since?: string;
-      query?: string;
-    };
-  }) {
-    return this.request("/v3/organizations/enrich", params);
-  }
-
-  async findJobs(params: {
-    organization?: { domain?: string; id?: number; slug?: string };
-    filters: {
-      technologies?: string[];
-      technology_categories?: string[];
-      countries?: string[];
-      since?: string;
-      query?: string;
-    };
-    limit?: number;
-    offset?: number;
-  }) {
-    return this.request("/v3/jobs/find", params);
-  }
-
-  async findPeople(params: {
-    organization: { domain?: string; id?: number; slug?: string };
-    filters: {
-      job_functions?: string[];
-      job_levels?: string[];
-      countries?: string[];
-      since?: string;
-      query?: string;
-    };
-    limit?: number;
-    offset?: number;
-  }) {
-    return this.request("/v3/people/find", params);
-  }
-}
-
-// =============================================================================
-// TOOL DEFINITIONS
-// =============================================================================
-
-const TOOLS: Tool[] = [
-  {
-    name: "find_organizations",
-    description: `Find organizations matching specific filters. Use this to discover companies based on their technology stack, industry, or other criteria.
-
-Cost: 5 credits per filter per organization found (minimum 5 credits per org).
-
-Examples:
-- Find companies using Python
-- Find companies in a specific technology category
-- Search for organizations matching a query`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        technologies: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "List of technologies to search for (e.g., ['python', 'react', 'aws'])",
-        },
-        technology_categories: {
-          type: "array",
-          items: { type: "string" },
-          description: "List of technology categories to search for",
-        },
-        query: {
-          type: "string",
-          description: "Free-text query to search organizations",
-        },
-        since: {
-          type: "string",
-          description: "Only consider data since this date. Format: YYYY-MM-DD",
-        },
-        order_by_column: {
-          type: "string",
-          enum: [
-            "industry",
-            "employee_count",
-            "employee_count_int",
-            "first_activity_time",
-            "last_activity_time",
-            "jobs_count",
-            "teams_count",
-            "people_count",
-            "jobs_count_growth_6mo",
-            "cloud_spend_estimate_millions_usd",
-          ],
-          description: "Column to order results by",
-        },
-        order_by_direction: {
-          type: "string",
-          enum: ["ASC", "DESC"],
-          description: "Sort direction",
-        },
-        limit: {
-          type: "integer",
-          minimum: 1,
-          maximum: 200,
-          default: 10,
-          description: "Maximum number of results to return (1-200)",
-        },
-        offset: {
-          type: "integer",
-          minimum: 0,
-          maximum: 10000,
-          default: 0,
-          description: "Number of results to skip for pagination",
-        },
-      },
-    },
-  },
-  {
-    name: "enrich_organization",
-    description: `Enrich a specific organization with technology data. Provide either a domain, Sumble ID, or slug to identify the organization.
-
-Cost: 5 credits per technology found.
-
-Use this to:
-- Get detailed technology stack for a company
-- Find what specific technologies a company uses
-- Discover technology adoption details including job posts and team usage`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        domain: {
-          type: "string",
-          description: "Company web domain (e.g., 'google.com')",
-        },
-        organization_id: {
-          type: "integer",
-          description: "Sumble organization ID",
-        },
-        slug: {
-          type: "string",
-          description: "Sumble organization slug",
-        },
-        technologies: {
-          type: "array",
-          items: { type: "string" },
-          description: "Specific technologies to search for",
-        },
-        technology_categories: {
-          type: "array",
-          items: { type: "string" },
-          description: "Technology categories to search for",
-        },
-        query: {
-          type: "string",
-          description: "Free-text query for technology search",
-        },
-        since: {
-          type: "string",
-          description: "Only consider data since this date. Format: YYYY-MM-DD",
-        },
-      },
-    },
-  },
-  {
-    name: "find_jobs",
-    description: `Find job listings, optionally scoped to a specific organization. Search by technologies, categories, or countries.
-
-Cost: 3 credits per job retrieved.
-
-Use this to:
-- Find job postings that mention specific technologies
-- Discover hiring trends at companies
-- Research job market for specific skills`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        domain: {
-          type: "string",
-          description: "Company domain to scope the search (optional)",
-        },
-        organization_id: {
-          type: "integer",
-          description: "Sumble organization ID to scope the search (optional)",
-        },
-        slug: {
-          type: "string",
-          description: "Sumble organization slug to scope the search (optional)",
-        },
-        technologies: {
-          type: "array",
-          items: { type: "string" },
-          description: "Technologies to search for in job postings",
-        },
-        technology_categories: {
-          type: "array",
-          items: { type: "string" },
-          description: "Technology categories to search for",
-        },
-        countries: {
-          type: "array",
-          items: { type: "string" },
-          description: "Countries to filter by (e.g., ['US', 'CA'])",
-        },
-        query: {
-          type: "string",
-          description: "Free-text query for job search",
-        },
-        since: {
-          type: "string",
-          description: "Only consider jobs since this date. Format: YYYY-MM-DD",
-        },
-        limit: {
-          type: "integer",
-          minimum: 1,
-          maximum: 100,
-          default: 10,
-          description: "Maximum number of jobs to return (1-100)",
-        },
-        offset: {
-          type: "integer",
-          minimum: 0,
-          maximum: 10000,
-          default: 0,
-          description: "Number of results to skip for pagination",
-        },
-      },
-    },
-  },
-  {
-    name: "find_people",
-    description: `Find people at a specific organization. Filter by job function, job level, or country.
-
-Cost: 1 credit per person found.
-
-Use this to:
-- Find decision-makers at a company
-- Discover team members with specific roles
-- Research organizational structure`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        domain: {
-          type: "string",
-          description: "Company web domain (e.g., 'google.com')",
-        },
-        organization_id: {
-          type: "integer",
-          description: "Sumble organization ID",
-        },
-        slug: {
-          type: "string",
-          description: "Sumble organization slug",
-        },
-        job_functions: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "Job functions to filter by (e.g., ['Engineer', 'Executive'])",
-        },
-        job_levels: {
-          type: "array",
-          items: { type: "string" },
-          description: "Job levels to filter by (e.g., ['Senior', 'Manager'])",
-        },
-        countries: {
-          type: "array",
-          items: { type: "string" },
-          description: "Countries to filter by (e.g., ['US', 'CA'])",
-        },
-        query: {
-          type: "string",
-          description: "Free-text query for people search",
-        },
-        since: {
-          type: "string",
-          description: "Only consider data since this date. Format: YYYY-MM-DD",
-        },
-        limit: {
-          type: "integer",
-          minimum: 1,
-          maximum: 250,
-          default: 10,
-          description: "Maximum number of people to return (1-250)",
-        },
-        offset: {
-          type: "integer",
-          minimum: 0,
-          maximum: 10000,
-          default: 0,
-          description: "Number of results to skip for pagination",
-        },
-      },
-    },
-  },
-];
-
-// =============================================================================
-// TOOL HANDLERS
-// =============================================================================
-
-async function handleToolCall(
-  client: SumbleClient,
-  toolName: string,
-  args: Record<string, unknown>
-): Promise<string> {
-  switch (toolName) {
-    case "find_organizations": {
-      const filters: Record<string, unknown> = {};
-
-      if (args.technologies) filters.technologies = args.technologies;
-      if (args.technology_categories)
-        filters.technology_categories = args.technology_categories;
-      if (args.since) filters.since = args.since;
-      if (args.query) filters.query = args.query;
-
-      const result = await client.findOrganizations({
-        filters:
-          Object.keys(filters).length > 0 ? filters : { technologies: [] },
-        order_by_column: args.order_by_column as string | undefined,
-        order_by_direction: args.order_by_direction as
-          | "ASC"
-          | "DESC"
-          | undefined,
-        limit: (args.limit as number) || 10,
-        offset: (args.offset as number) || 0,
-      });
-
-      return JSON.stringify(result, null, 2);
-    }
-
-    case "enrich_organization": {
-      const organization: Record<string, unknown> = {};
-      if (args.domain) organization.domain = args.domain;
-      else if (args.organization_id) organization.id = args.organization_id;
-      else if (args.slug) organization.slug = args.slug;
-      else throw new Error("Must provide domain, organization_id, or slug");
-
-      const filters: Record<string, unknown> = {};
-      if (args.technologies) filters.technologies = args.technologies;
-      if (args.technology_categories)
-        filters.technology_categories = args.technology_categories;
-      if (args.since) filters.since = args.since;
-      if (args.query) filters.query = args.query;
-
-      const result = await client.enrichOrganization({
-        organization,
-        filters:
-          Object.keys(filters).length > 0 ? filters : { technologies: [] },
-      });
-
-      return JSON.stringify(result, null, 2);
-    }
-
-    case "find_jobs": {
-      let organization: Record<string, unknown> | undefined;
-      if (args.domain) organization = { domain: args.domain };
-      else if (args.organization_id)
-        organization = { id: args.organization_id };
-      else if (args.slug) organization = { slug: args.slug };
-
-      const filters: Record<string, unknown> = {};
-      if (args.technologies) filters.technologies = args.technologies;
-      if (args.technology_categories)
-        filters.technology_categories = args.technology_categories;
-      if (args.countries) filters.countries = args.countries;
-      if (args.since) filters.since = args.since;
-      if (args.query) filters.query = args.query;
-
-      const result = await client.findJobs({
-        organization,
-        filters:
-          Object.keys(filters).length > 0 ? filters : { technologies: [] },
-        limit: (args.limit as number) || 10,
-        offset: (args.offset as number) || 0,
-      });
-
-      return JSON.stringify(result, null, 2);
-    }
-
-    case "find_people": {
-      const organization: Record<string, unknown> = {};
-      if (args.domain) organization.domain = args.domain;
-      else if (args.organization_id) organization.id = args.organization_id;
-      else if (args.slug) organization.slug = args.slug;
-      else throw new Error("Must provide domain, organization_id, or slug");
-
-      const filters: Record<string, unknown> = {};
-      if (args.job_functions) filters.job_functions = args.job_functions;
-      if (args.job_levels) filters.job_levels = args.job_levels;
-      if (args.countries) filters.countries = args.countries;
-      if (args.since) filters.since = args.since;
-      if (args.query) filters.query = args.query;
-
-      const result = await client.findPeople({
-        organization,
-        filters: Object.keys(filters).length > 0 ? filters : {},
-        limit: (args.limit as number) || 10,
-        offset: (args.offset as number) || 0,
-      });
-
-      return JSON.stringify(result, null, 2);
-    }
-
-    default:
-      throw new Error(`Unknown tool: ${toolName}`);
-  }
-}
-
-// =============================================================================
-// HTTP/SSE SERVER
-// =============================================================================
-
-const PORT = parseInt(process.env.PORT || "3000", 10);
-
-// Store active transports by session ID
-const transports = new Map<string, SSEServerTransport>();
-
-async function main() {
-  const apiKey = process.env.SUMBLE_API_KEY;
-  if (!apiKey) {
-    console.error("Error: SUMBLE_API_KEY environment variable is required");
-    process.exit(1);
-  }
-
-  const client = new SumbleClient({ apiKey });
-
-  const httpServer = http.createServer(async (req, res) => {
-    // Enable CORS
-    res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
-    if (req.method === "OPTIONS") {
-      res.writeHead(204);
-      res.end();
+  // Message endpoint
+  if (url.pathname === "/message" && req.method === "POST") {
+    const sessionId = url.searchParams.get("sessionId");
+    
+    if (!sessionId || !clients.has(sessionId)) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Invalid session" }));
       return;
     }
 
-    const url = new URL(req.url || "/", `http://localhost:${PORT}`);
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", async () => {
+      try {
+        const message = JSON.parse(body);
+        const client = clients.get(sessionId);
 
-    // Health check endpoint
-    if (url.pathname === "/health" && req.method === "GET") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", server: "sumble-mcp-server" }));
-      return;
-    }
-
-    // SSE endpoint for MCP
-    if (url.pathname === "/sse" && req.method === "GET") {
-      console.log("New SSE connection");
-
-      // Create a new MCP server for this connection
-      const server = new Server(
-        {
-          name: "sumble-mcp-server",
-          version: "1.0.0",
-        },
-        {
-          capabilities: {
-            tools: {},
-          },
-        }
-      );
-
-      // Set up tool handlers
-      server.setRequestHandler(ListToolsRequestSchema, async () => {
-        return { tools: TOOLS };
-      });
-
-      server.setRequestHandler(CallToolRequestSchema, async (request) => {
-        const { name, arguments: args } = request.params;
-
-        try {
-          const result = await handleToolCall(
-            client,
-            name,
-            args as Record<string, unknown>
-          );
-          return {
-            content: [{ type: "text", text: result }],
+        // Handle MCP messages
+        if (message.method === "initialize") {
+          const response = {
+            jsonrpc: "2.0",
+            id: message.id,
+            result: {
+              protocolVersion: "2024-11-05",
+              capabilities: { tools: {} },
+              serverInfo: { name: "sumble-mcp-server", version: "1.0.0" },
+            },
           };
-        } catch (error) {
-          const errorMessage =
-            error instanceof Error ? error.message : String(error);
-          return {
-            content: [{ type: "text", text: `Error: ${errorMessage}` }],
-            isError: true,
-          };
-        }
-      });
-
-      // Create SSE transport
-      const transport = new SSEServerTransport("/message", res);
-      
-      // Store transport for message handling
-      const sessionId = Math.random().toString(36).substring(7);
-      transports.set(sessionId, transport);
-
-      // Clean up on close
-      res.on("close", () => {
-        transports.delete(sessionId);
-        console.log("SSE connection closed");
-      });
-
-      // Connect server to transport
-      await server.connect(transport);
-      return;
-    }
-
-    // Message endpoint for client-to-server communication
-    if (url.pathname === "/message" && req.method === "POST") {
-      let body = "";
-      req.on("data", (chunk) => {
-        body += chunk.toString();
-      });
-
-      req.on("end", async () => {
-        try {
-          // Find the transport that matches this request
-          // In a production setup, you'd use session management
-          const sessionId = url.searchParams.get("sessionId");
-          const transport = sessionId ? transports.get(sessionId) : null;
-
-          if (transport) {
-            await transport.handlePostMessage(req, res, body);
-          } else {
-            res.writeHead(400, { "Content-Type": "application/json" });
-            res.end(JSON.stringify({ error: "No active session" }));
+          client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
+          res.writeHead(202);
+          res.end();
+        } else if (message.method === "tools/list") {
+          const tools = [
+            {
+              name: "find_organizations",
+              description: "Search for organizations by technology stack, industry, location. Costs 5 credits/filter/org.",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  technologies: { type: "array", items: { type: "string" }, description: "Technologies to filter by" },
+                  industries: { type: "array", items: { type: "string" }, description: "Industries to filter by" },
+                  countries: { type: "array", items: { type: "string" }, description: "Countries to filter by" },
+                  employee_range: { type: "string", description: "Employee range like '1-10', '11-50'" },
+                  limit: { type: "number", description: "Max results", default: 10 },
+                },
+              },
+            },
+            {
+              name: "enrich_organization",
+              description: "Get detailed tech stack for a company domain. Costs 5 credits/technology.",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  domain: { type: "string", description: "Company domain (e.g., 'example.com')" },
+                },
+                required: ["domain"],
+              },
+            },
+            {
+              name: "find_jobs",
+              description: "Search job listings. Costs 3 credits/job.",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  keywords: { type: "string", description: "Search keywords" },
+                  technologies: { type: "array", items: { type: "string" }, description: "Technologies" },
+                  countries: { type: "array", items: { type: "string" }, description: "Countries" },
+                  remote: { type: "boolean", description: "Remote only" },
+                  limit: { type: "number", description: "Max results", default: 10 },
+                },
+              },
+            },
+            {
+              name: "find_people",
+              description: "Search for contacts at companies. Costs 1 credit/person.",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  organization_domain: { type: "string", description: "Company domain" },
+                  job_titles: { type: "array", items: { type: "string" }, description: "Job titles" },
+                  countries: { type: "array", items: { type: "string" }, description: "Countries" },
+                  limit: { type: "number", description: "Max results", default: 10 },
+                },
+              },
+            },
+          ];
+          const response = { jsonrpc: "2.0", id: message.id, result: { tools } };
+          client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
+          res.writeHead(202);
+          res.end();
+        } else if (message.method === "tools/call") {
+          const toolName = message.params?.name;
+          const args = message.params?.arguments || {};
+          
+          try {
+            let result;
+            if (toolName === "find_organizations") {
+              result = await sumbleRequest("/v1/organizations/search", "POST", args);
+            } else if (toolName === "enrich_organization") {
+              result = await sumbleRequest(`/v1/organizations/enrich?domain=${encodeURIComponent(args.domain)}`);
+            } else if (toolName === "find_jobs") {
+              result = await sumbleRequest("/v1/jobs/search", "POST", args);
+            } else if (toolName === "find_people") {
+              result = await sumbleRequest("/v1/people/search", "POST", args);
+            } else {
+              throw new Error(`Unknown tool: ${toolName}`);
+            }
+            
+            const response = {
+              jsonrpc: "2.0",
+              id: message.id,
+              result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
+            };
+            client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
+          } catch (err: any) {
+            const response = {
+              jsonrpc: "2.0",
+              id: message.id,
+              error: { code: -32000, message: err.message },
+            };
+            client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
           }
-        } catch (error) {
-          console.error("Error handling message:", error);
-          res.writeHead(500, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "Internal server error" }));
+          res.writeHead(202);
+          res.end();
+        } else if (message.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+        } else {
+          const response = {
+            jsonrpc: "2.0",
+            id: message.id,
+            error: { code: -32601, message: "Method not found" },
+          };
+          client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
+          res.writeHead(202);
+          res.end();
         }
-      });
-      return;
-    }
+      } catch (err: any) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
 
-    // 404 for everything else
-    res.writeHead(404, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ error: "Not found" }));
-  });
+  res.writeHead(404);
+  res.end("Not found");
+});
 
-  httpServer.listen(PORT, () => {
-    console.log(`Sumble MCP Server (HTTP/SSE) running on port ${PORT}`);
-    console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
-    console.log(`Health check: http://localhost:${PORT}/health`);
-  });
-}
-
-main().catch((error) => {
-  console.error("Fatal error:", error);
-  process.exit(1);
+httpServer.listen(PORT, () => {
+  console.log(`Sumble MCP Server running on port ${PORT}`);
+  console.log(`SSE endpoint: http://localhost:${PORT}/sse`);
 });
