@@ -1,5 +1,3 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
 import http from "http";
 
 const SUMBLE_API_KEY = process.env.SUMBLE_API_KEY;
@@ -30,77 +28,7 @@ async function sumbleRequest(endpoint: string, method: string = "GET", body?: an
   return response.json();
 }
 
-// Create MCP server
-const server = new McpServer({
-  name: "sumble-mcp-server",
-  version: "1.0.0",
-});
-
-// Register tools
-server.tool(
-  "find_organizations",
-  "Search for organizations by technology stack, industry, location, and other criteria. Costs 5 credits per filter per organization returned.",
-  {
-    technologies: z.array(z.string()).optional().describe("Filter by technologies used"),
-    industries: z.array(z.string()).optional().describe("Filter by industries"),
-    countries: z.array(z.string()).optional().describe("Filter by countries"),
-    employee_range: z.string().optional().describe("Employee range like '1-10', '11-50', '51-200'"),
-    limit: z.number().optional().default(10).describe("Maximum results to return"),
-    offset: z.number().optional().default(0).describe("Offset for pagination"),
-  },
-  async (params) => {
-    const result = await sumbleRequest("/v1/organizations/search", "POST", params);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  }
-);
-
-server.tool(
-  "enrich_organization",
-  "Get detailed technology stack and company information for a specific organization. Costs 5 credits per technology returned.",
-  {
-    domain: z.string().describe("Company domain to enrich (e.g., 'example.com')"),
-  },
-  async (params) => {
-    const result = await sumbleRequest(`/v1/organizations/enrich?domain=${encodeURIComponent(params.domain)}`);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  }
-);
-
-server.tool(
-  "find_jobs",
-  "Search for job listings. Costs 3 credits per job returned.",
-  {
-    keywords: z.string().optional().describe("Keywords to search for"),
-    technologies: z.array(z.string()).optional().describe("Filter by technologies"),
-    countries: z.array(z.string()).optional().describe("Filter by countries"),
-    remote: z.boolean().optional().describe("Filter for remote jobs"),
-    limit: z.number().optional().default(10).describe("Maximum results"),
-    offset: z.number().optional().default(0).describe("Offset for pagination"),
-  },
-  async (params) => {
-    const result = await sumbleRequest("/v1/jobs/search", "POST", params);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  }
-);
-
-server.tool(
-  "find_people",
-  "Search for people/contacts at companies. Costs 1 credit per person returned.",
-  {
-    organization_domain: z.string().optional().describe("Filter by company domain"),
-    job_titles: z.array(z.string()).optional().describe("Filter by job titles"),
-    countries: z.array(z.string()).optional().describe("Filter by countries"),
-    limit: z.number().optional().default(10).describe("Maximum results"),
-    offset: z.number().optional().default(0).describe("Offset for pagination"),
-  },
-  async (params) => {
-    const result = await sumbleRequest("/v1/people/search", "POST", params);
-    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
-  }
-);
-
-// Simple HTTP server with SSE support
-const PORT = parseInt(process.env.PORT || "3000");
+const PORT = parseInt(process.env.PORT || "10000");
 
 interface SSEClient {
   id: string;
@@ -113,7 +41,8 @@ const httpServer = http.createServer(async (req, res) => {
   // CORS headers
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
+  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
 
   if (req.method === "OPTIONS") {
     res.writeHead(204);
@@ -132,34 +61,41 @@ const httpServer = http.createServer(async (req, res) => {
 
   // SSE endpoint
   if (url.pathname === "/sse" && req.method === "GET") {
-    const clientId = Math.random().toString(36).substring(7);
+    const clientId = Math.random().toString(36).substring(2, 10);
     
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
+      "Cache-Control": "no-cache, no-transform",
       "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
     });
 
-    // Send endpoint info
-    const endpoint = `${url.protocol}//${req.headers.host}/message?sessionId=${clientId}`;
-    res.write(`event: endpoint\ndata: ${endpoint}\n\n`);
+    // Determine the correct protocol and host
+    const proto = req.headers["x-forwarded-proto"] || "https";
+    const host = req.headers["x-forwarded-host"] || req.headers.host || "sumble-mcp-server.onrender.com";
+    const baseUrl = `${proto}://${host}`;
+    
+    // Send endpoint event
+    const messageEndpoint = `${baseUrl}/message?sessionId=${clientId}`;
+    res.write(`event: endpoint\ndata: ${messageEndpoint}\n\n`);
 
     clients.set(clientId, { id: clientId, res });
     console.log(`New SSE connection: ${clientId}`);
 
-    req.on("close", () => {
-      clients.delete(clientId);
-      console.log(`SSE connection closed: ${clientId}`);
-    });
-
-    // Keep alive
+    // Keep connection alive
     const keepAlive = setInterval(() => {
       if (clients.has(clientId)) {
-        res.write(": keepalive\n\n");
+        res.write(`:keepalive\n\n`);
       } else {
         clearInterval(keepAlive);
       }
-    }, 30000);
+    }, 15000);
+
+    req.on("close", () => {
+      clients.delete(clientId);
+      clearInterval(keepAlive);
+      console.log(`SSE connection closed: ${clientId}`);
+    });
 
     return;
   }
@@ -170,7 +106,7 @@ const httpServer = http.createServer(async (req, res) => {
     
     if (!sessionId || !clients.has(sessionId)) {
       res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "Invalid session" }));
+      res.end(JSON.stringify({ error: "Invalid or expired session" }));
       return;
     }
 
@@ -180,6 +116,8 @@ const httpServer = http.createServer(async (req, res) => {
       try {
         const message = JSON.parse(body);
         const client = clients.get(sessionId);
+
+        console.log(`Received message: ${message.method}`);
 
         // Handle MCP messages
         if (message.method === "initialize") {
@@ -193,8 +131,8 @@ const httpServer = http.createServer(async (req, res) => {
             },
           };
           client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
-          res.writeHead(202);
-          res.end();
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "accepted" }));
         } else if (message.method === "tools/list") {
           const tools = [
             {
@@ -252,8 +190,8 @@ const httpServer = http.createServer(async (req, res) => {
           ];
           const response = { jsonrpc: "2.0", id: message.id, result: { tools } };
           client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
-          res.writeHead(202);
-          res.end();
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "accepted" }));
         } else if (message.method === "tools/call") {
           const toolName = message.params?.name;
           const args = message.params?.arguments || {};
@@ -286,11 +224,11 @@ const httpServer = http.createServer(async (req, res) => {
             };
             client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
           }
-          res.writeHead(202);
-          res.end();
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "accepted" }));
         } else if (message.method === "notifications/initialized") {
-          res.writeHead(202);
-          res.end();
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "accepted" }));
         } else {
           const response = {
             jsonrpc: "2.0",
@@ -298,10 +236,11 @@ const httpServer = http.createServer(async (req, res) => {
             error: { code: -32601, message: "Method not found" },
           };
           client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
-          res.writeHead(202);
-          res.end();
+          res.writeHead(202, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ status: "accepted" }));
         }
       } catch (err: any) {
+        console.error("Error processing message:", err);
         res.writeHead(400, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
@@ -309,8 +248,8 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  res.writeHead(404);
-  res.end("Not found");
+  res.writeHead(404, { "Content-Type": "application/json" });
+  res.end(JSON.stringify({ error: "Not found" }));
 });
 
 httpServer.listen(PORT, () => {
