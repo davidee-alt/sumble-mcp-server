@@ -24,3 +24,29 @@ ENV NODE_ENV=production
 
 # Run the HTTP server
 CMD ["node", "dist/server-http.js"]
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm install
+
+# Copy source and build
+COPY tsconfig.json ./
+COPY src ./src
+
+# Build TypeScript
+RUN npm run build
+
+# Expose port
+EXPOSE 3000
+
+# Set default environment
+ENV PORT=3000
+ENV NODE_ENV=production
+
+# Run the HTTP server
+CMD ["node", "dist/server-http.js"]
