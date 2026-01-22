@@ -62,7 +62,7 @@ const httpServer = http.createServer(async (req, res) => {
   // SSE endpoint
   if (url.pathname === "/sse" && req.method === "GET") {
     const clientId = Math.random().toString(36).substring(2, 10);
-    
+
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
@@ -74,7 +74,7 @@ const httpServer = http.createServer(async (req, res) => {
     const proto = req.headers["x-forwarded-proto"] || "https";
     const host = req.headers["x-forwarded-host"] || req.headers.host || "sumble-mcp-server.onrender.com";
     const baseUrl = `${proto}://${host}`;
-    
+
     // Send endpoint event
     const messageEndpoint = `${baseUrl}/message?sessionId=${clientId}`;
     res.write(`event: endpoint\ndata: ${messageEndpoint}\n\n`);
@@ -82,14 +82,14 @@ const httpServer = http.createServer(async (req, res) => {
     clients.set(clientId, { id: clientId, res });
     console.log(`New SSE connection: ${clientId}`);
 
-    // Keep connection alive
+    // Keep connection alive - more frequent keep-alives
     const keepAlive = setInterval(() => {
       if (clients.has(clientId)) {
         res.write(`:keepalive\n\n`);
       } else {
         clearInterval(keepAlive);
       }
-    }, 15000);
+    }, 5000); // Reduced from 15s to 5s
 
     req.on("close", () => {
       clients.delete(clientId);
@@ -100,10 +100,9 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // Message endpoint
+  // Message endpoint - now handles responses synchronously
   if (url.pathname === "/message" && req.method === "POST") {
     const sessionId = url.searchParams.get("sessionId");
-    
     if (!sessionId || !clients.has(sessionId)) {
       res.writeHead(400, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: "Invalid or expired session" }));
@@ -111,17 +110,21 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     let body = "";
-    req.on("data", (chunk) => { body += chunk; });
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
+
     req.on("end", async () => {
       try {
         const message = JSON.parse(body);
         const client = clients.get(sessionId);
-
         console.log(`Received message: ${message.method}`);
+
+        let response: any;
 
         // Handle MCP messages
         if (message.method === "initialize") {
-          const response = {
+          response = {
             jsonrpc: "2.0",
             id: message.id,
             result: {
@@ -130,9 +133,6 @@ const httpServer = http.createServer(async (req, res) => {
               serverInfo: { name: "sumble-mcp-server", version: "1.0.0" },
             },
           };
-          client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
-          res.writeHead(202, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "accepted" }));
         } else if (message.method === "tools/list") {
           const tools = [
             {
@@ -188,14 +188,13 @@ const httpServer = http.createServer(async (req, res) => {
               },
             },
           ];
-          const response = { jsonrpc: "2.0", id: message.id, result: { tools } };
-          client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
-          res.writeHead(202, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "accepted" }));
+          response = { jsonrpc: "2.0", id: message.id, result: { tools } };
         } else if (message.method === "tools/call") {
           const toolName = message.params?.name;
           const args = message.params?.arguments || {};
-          
+
+          console.log(`Executing tool: ${toolName} with args:`, JSON.stringify(args));
+
           try {
             let result;
             if (toolName === "find_organizations") {
@@ -209,35 +208,43 @@ const httpServer = http.createServer(async (req, res) => {
             } else {
               throw new Error(`Unknown tool: ${toolName}`);
             }
-            
-            const response = {
+
+            console.log(`Tool ${toolName} completed successfully`);
+            response = {
               jsonrpc: "2.0",
               id: message.id,
               result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
             };
-            client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
           } catch (err: any) {
-            const response = {
+            console.error(`Tool ${toolName} failed:`, err.message);
+            response = {
               jsonrpc: "2.0",
               id: message.id,
               error: { code: -32000, message: err.message },
             };
-            client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
           }
-          res.writeHead(202, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "accepted" }));
         } else if (message.method === "notifications/initialized") {
+          // No response needed for notifications
           res.writeHead(202, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ status: "accepted" }));
+          return;
         } else {
-          const response = {
+          response = {
             jsonrpc: "2.0",
             id: message.id,
             error: { code: -32601, message: "Method not found" },
           };
+        }
+
+        // Send response via SSE AND return it in the POST response
+        if (response) {
+          // Send via SSE for clients that expect it
           client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
-          res.writeHead(202, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ status: "accepted" }));
+          
+          // Also return in POST response body for synchronous clients
+          console.log(`Sending response for message id: ${message.id}`);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(response));
         }
       } catch (err: any) {
         console.error("Error processing message:", err);
