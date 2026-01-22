@@ -20,6 +20,9 @@ async function sumbleRequest(endpoint: string, method: string = "GET", body?: an
   if (body) {
     options.body = JSON.stringify(body);
   }
+  console.log(`Sumble API request: ${method} ${url}`);
+  if (body) console.log(`Request body: ${JSON.stringify(body)}`);
+  
   const response = await fetch(url, options);
   if (!response.ok) {
     const errorText = await response.text();
@@ -38,7 +41,6 @@ interface SSEClient {
 const clients = new Map<string, SSEClient>();
 
 const httpServer = http.createServer(async (req, res) => {
-  // CORS headers
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
@@ -52,14 +54,12 @@ const httpServer = http.createServer(async (req, res) => {
 
   const url = new URL(req.url || "/", `http://localhost:${PORT}`);
 
-  // Health check
   if (url.pathname === "/" || url.pathname === "/health") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ status: "ok", server: "sumble-mcp-server" }));
     return;
   }
 
-  // SSE endpoint
   if (url.pathname === "/sse" && req.method === "GET") {
     const clientId = Math.random().toString(36).substring(2, 10);
 
@@ -70,26 +70,23 @@ const httpServer = http.createServer(async (req, res) => {
       "X-Accel-Buffering": "no",
     });
 
-    // Determine the correct protocol and host
     const proto = req.headers["x-forwarded-proto"] || "https";
     const host = req.headers["x-forwarded-host"] || req.headers.host || "sumble-mcp-server.onrender.com";
     const baseUrl = `${proto}://${host}`;
 
-    // Send endpoint event
     const messageEndpoint = `${baseUrl}/message?sessionId=${clientId}`;
     res.write(`event: endpoint\ndata: ${messageEndpoint}\n\n`);
 
     clients.set(clientId, { id: clientId, res });
     console.log(`New SSE connection: ${clientId}`);
 
-    // Keep connection alive - more frequent keep-alives
     const keepAlive = setInterval(() => {
       if (clients.has(clientId)) {
         res.write(`:keepalive\n\n`);
       } else {
         clearInterval(keepAlive);
       }
-    }, 5000); // Reduced from 15s to 5s
+    }, 5000);
 
     req.on("close", () => {
       clients.delete(clientId);
@@ -100,7 +97,6 @@ const httpServer = http.createServer(async (req, res) => {
     return;
   }
 
-  // Message endpoint - now handles responses synchronously
   if (url.pathname === "/message" && req.method === "POST") {
     const sessionId = url.searchParams.get("sessionId");
     if (!sessionId || !clients.has(sessionId)) {
@@ -110,9 +106,7 @@ const httpServer = http.createServer(async (req, res) => {
     }
 
     let body = "";
-    req.on("data", (chunk) => {
-      body += chunk;
-    });
+    req.on("data", (chunk) => { body += chunk; });
 
     req.on("end", async () => {
       try {
@@ -122,7 +116,6 @@ const httpServer = http.createServer(async (req, res) => {
 
         let response: any;
 
-        // Handle MCP messages
         if (message.method === "initialize") {
           response = {
             jsonrpc: "2.0",
@@ -135,113 +128,74 @@ const httpServer = http.createServer(async (req, res) => {
           };
         } else if (message.method === "tools/list") {
           const tools = [
-            {
-              name: "find_organizations",
-              description: "Search for organizations by technology stack, industry, location. Costs 5 credits/filter/org.",
-              inputSchema: {
-                type: "object",
-                properties: {
-                  technologies: { type: "array", items: { type: "string" }, description: "Technologies to filter by" },
-                  industries: { type: "array", items: { type: "string" }, description: "Industries to filter by" },
-                  countries: { type: "array", items: { type: "string" }, description: "Countries to filter by" },
-                  employee_range: { type: "string", description: "Employee range like '1-10', '11-50'" },
-                  limit: { type: "number", description: "Max results", default: 10 },
-                },
-              },
-            },
-            {
-              name: "enrich_organization",
-              description: "Get detailed tech stack for a company domain. Costs 5 credits/technology.",
-              inputSchema: {
-                type: "object",
-                properties: {
-                  domain: { type: "string", description: "Company domain (e.g., 'example.com')" },
-                },
-                required: ["domain"],
-              },
-            },
-            {
-              name: "find_jobs",
-              description: "Search job listings. Costs 3 credits/job.",
-              inputSchema: {
-                type: "object",
-                properties: {
-                  keywords: { type: "string", description: "Search keywords" },
-                  technologies: { type: "array", items: { type: "string" }, description: "Technologies" },
-                  countries: { type: "array", items: { type: "string" }, description: "Countries" },
-                  remote: { type: "boolean", description: "Remote only" },
-                  limit: { type: "number", description: "Max results", default: 10 },
-                },
-              },
-            },
-            {
-              name: "find_people",
-              description: "Search for contacts at companies. Costs 1 credit/person.",
-              inputSchema: {
-                type: "object",
-                properties: {
-                  organization_domain: { type: "string", description: "Company domain" },
-                  job_titles: { type: "array", items: { type: "string" }, description: "Job titles" },
-                  countries: { type: "array", items: { type: "string" }, description: "Countries" },
-                  limit: { type: "number", description: "Max results", default: 10 },
-                },
-              },
-            },
+            { name: "find_organizations", description: "Search for organizations by technology stack, industry, location. Costs 5 credits/filter/org.", inputSchema: { type: "object", properties: { technologies: { type: "array", items: { type: "string" }, description: "Technologies to filter by" }, industries: { type: "array", items: { type: "string" }, description: "Industries to filter by" }, countries: { type: "array", items: { type: "string" }, description: "Countries to filter by" }, employee_range: { type: "string", description: "Employee range like '1-10', '11-50'" }, limit: { type: "number", description: "Max results", default: 10 } } } },
+            { name: "enrich_organization", description: "Get detailed tech stack for a company domain. Costs 5 credits/technology.", inputSchema: { type: "object", properties: { domain: { type: "string", description: "Company domain (e.g., 'example.com')" } }, required: ["domain"] } },
+            { name: "find_jobs", description: "Search job listings. Costs 3 credits/job.", inputSchema: { type: "object", properties: { keywords: { type: "string", description: "Search keywords" }, technologies: { type: "array", items: { type: "string" }, description: "Technologies" }, countries: { type: "array", items: { type: "string" }, description: "Countries" }, remote: { type: "boolean", description: "Remote only" }, limit: { type: "number", description: "Max results", default: 10 } } } },
+            { name: "find_people", description: "Search for contacts at companies. Costs 1 credit/person.", inputSchema: { type: "object", properties: { organization_domain: { type: "string", description: "Company domain" }, job_titles: { type: "array", items: { type: "string" }, description: "Job titles" }, countries: { type: "array", items: { type: "string" }, description: "Countries" }, limit: { type: "number", description: "Max results", default: 10 } } } },
           ];
           response = { jsonrpc: "2.0", id: message.id, result: { tools } };
         } else if (message.method === "tools/call") {
           const toolName = message.params?.name;
           const args = message.params?.arguments || {};
-
-          console.log(`Executing tool: ${toolName} with args:`, JSON.stringify(args));
+          console.log(`Executing tool: ${toolName} with args: ${JSON.stringify(args)}`);
 
           try {
             let result;
             if (toolName === "find_organizations") {
-              result = await sumbleRequest("/v1/organizations/search", "POST", args);
+              // v2 endpoint for finding organizations
+              result = await sumbleRequest("/v2/organizations/find", "POST", {
+                filters: {
+                  technologies: args.technologies || [],
+                  industries: args.industries || [],
+                  countries: args.countries || [],
+                },
+                limit: args.limit || 10,
+              });
             } else if (toolName === "enrich_organization") {
-              result = await sumbleRequest(`/v1/organizations/enrich?domain=${encodeURIComponent(args.domain)}`);
+              // v2 endpoint for enriching - requires POST with nested structure
+              result = await sumbleRequest("/v2/organizations/enrich", "POST", {
+                organization: { domain: args.domain },
+                filters: {},
+              });
             } else if (toolName === "find_jobs") {
-              result = await sumbleRequest("/v1/jobs/search", "POST", args);
+              // v2 endpoint for jobs
+              result = await sumbleRequest("/v2/jobs/find", "POST", {
+                filters: {
+                  technologies: args.technologies || [],
+                  countries: args.countries || [],
+                  keywords: args.keywords ? [args.keywords] : [],
+                },
+                limit: args.limit || 10,
+              });
             } else if (toolName === "find_people") {
-              result = await sumbleRequest("/v1/people/search", "POST", args);
+              // v3 endpoint for people
+              result = await sumbleRequest("/v3/people/find", "POST", {
+                organization: { domain: args.organization_domain },
+                filters: {
+                  job_titles: args.job_titles || [],
+                  countries: args.countries || [],
+                },
+                limit: args.limit || 10,
+              });
             } else {
               throw new Error(`Unknown tool: ${toolName}`);
             }
-
             console.log(`Tool ${toolName} completed successfully`);
-            response = {
-              jsonrpc: "2.0",
-              id: message.id,
-              result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] },
-            };
+            response = { jsonrpc: "2.0", id: message.id, result: { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] } };
           } catch (err: any) {
             console.error(`Tool ${toolName} failed:`, err.message);
-            response = {
-              jsonrpc: "2.0",
-              id: message.id,
-              error: { code: -32000, message: err.message },
-            };
+            response = { jsonrpc: "2.0", id: message.id, error: { code: -32000, message: err.message } };
           }
         } else if (message.method === "notifications/initialized") {
-          // No response needed for notifications
           res.writeHead(202, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ status: "accepted" }));
           return;
         } else {
-          response = {
-            jsonrpc: "2.0",
-            id: message.id,
-            error: { code: -32601, message: "Method not found" },
-          };
+          response = { jsonrpc: "2.0", id: message.id, error: { code: -32601, message: "Method not found" } };
         }
 
-        // Send response via SSE AND return it in the POST response
         if (response) {
-          // Send via SSE for clients that expect it
           client?.res.write(`event: message\ndata: ${JSON.stringify(response)}\n\n`);
-          
-          // Also return in POST response body for synchronous clients
           console.log(`Sending response for message id: ${message.id}`);
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify(response));
