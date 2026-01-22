@@ -19,11 +19,11 @@ RUN npx tsc
 RUN npm prune --production
 
 # Expose port
-EXPOSE 3000
+EXPOSE 10000
 
 # Set default environment
-ENV PORT=3000
+ENV PORT=10000
 ENV NODE_ENV=production
 
-# Run the HTTP server
-CMD ["node", "dist/server-http.js"]
+# Run the server
+CMD ["node", "dist/server.js"]
